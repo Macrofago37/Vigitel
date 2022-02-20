@@ -1,0 +1,365 @@
+---
+title: "VIGITEL"
+author: "Luiz Felipe Martucci"
+date: "2/18/2022"
+output: 
+  html_document:
+    keep_md: TRUE
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Pacotes utilizados:
+```{r}
+x <- c("readxl", "tidyverse", "leaflet", "caret", "scales", "broom", "knitr", "kableExtra", "rgdal")
+(function(x){
+  sapply(x, function(x) if(!x %in% installed.packages()){
+    install.packages(x, dependencies = T)
+  })
+  sapply(x, library, character.only=T)
+})(x)
+
+```
+
+Download dos dados dos VIGITEL
+```{r eval=FALSE, include=FALSE}
+vigitel_ano <- tibble("http://svs.aids.gov.br/download/Vigitel/Vigitel-", seq(from=2006, to=2020, by=1),"-peso-rake.xls")  
+links <- apply(vigitel_ano, 1,  list) %>% sapply(., function(x) x[[1]] %>% unname() %>% paste(collapse=""))
+
+#download.file(links, basename(links), method = "libcurl")
+```
+
+Carrega os dados de 2020 e Helper
+```{r}
+v2020<- read_excel("Vigitel-2020-peso-rake.xls")
+
+Helper_2020 <-  read_excel("Dicionario-de-dados-Vigitel 2020.xls", 
+                           skip = 2)
+
+
+```
+Ajusta os dados de interesse
+```{r}
+# Escreve tabela para adicionar o nome das colunas manualmente
+# write_csv(x=tibble(colnames=v2020 %>% colnames()),
+#         file="vig2020.csv")
+
+
+#Carega as colunas para serem mantidas e os nomes corretos
+cols_keep <- read_delim("vig2020.csv", delim = ";", 
+           escape_double = FALSE, trim_ws = TRUE)%>% drop_na()
+
+
+#Ajusta o nome das colunas e seleciona as colunas que serão mantidas no DF original
+#Alem disso troca os valores 777 e 888 por NA
+v2020 <- v2020 %>% select(cols_keep$colnames) %>%
+  rename_with(~cols_keep[[2]],
+              .cols=cols_keep$colnames) %>%
+  sapply(., function(x) replace(x, x %in% c("777", "888"), NA))
+
+  
+# Cria tabela para adicionar os níveis dos fatores
+# write.csv(x=v2020_n %>% colnames()%>% t(), file="clean_vig2020.csv")
+
+levels_2020 <- read_excel("levels_vig2020ab.xlsx")  %>% mutate(across(.cols=everything(), as.factor))
+
+
+#Transforma variáveis character em númericas
+v2020<- as_tibble(v2020) %>% 
+  mutate(across(which(!(colnames(v2020)  %in% colnames(levels_2020))),
+                ~as.numeric(.)))
+
+
+#Transforma em fator as varíaveis que são fatores
+v2020<- v2020 %>% mutate(across(.cols=which(colnames(v2020)  %in% colnames(levels_2020)),
+                          ~as.factor(.)))
+
+#Corrige o nome dos fatores
+v2020 <- (function(x, y){
+  colfactors <- y %>% select(
+  match(colnames(x), colnames(.)))
+  
+  leng <- seq(1, ncol(x))
+  
+  map2(.x=levels_2020, .y=leng, .f=function(x,y){
+  tibble(x[colfactors[[y]]]) 
+})
+})(levels_2020, v2020) %>%
+  as.data.frame() %>% 
+  rename_with(~colnames(levels_2020)) %>% 
+  mutate(chave=v2020$chave) %>% 
+  left_join( v2020 %>% select(
+  setdiff(colnames(.), colnames(levels_2020))),
+  by="chave")
+  
+
+
+
+
+#Adc estado
+Estado_capital <- read_excel("Estado-capital.xlsx") %>% mutate(cidade=tolower(cidade),
+                                                               estado=toupper(estado))
+v2020 <- v2020 %>% left_join(Estado_capital, by="cidade")
+```
+
+Calcula novas variáveis:
+- IMC
+- Classificação do IMC
+- Nível de atividade física (AF) em minutos
+- Tempo em tela (Screen time), que será considerado como tempo em comportamento sedentário
+
+```{r}
+#Parse numbers of observations and average
+Parse_avg <- function(x){
+  as.data.frame(str_extract_all(x, "(\\d)+", simplify = T)) %>% 
+  map_df(as.numeric) %>% 
+  mutate(V2= coalesce(V2, V1)) %>% 
+  rowMeans() 
+}
+
+
+
+#IMC e classificação
+v2020<-v2020%>% mutate(IMC=Massa_corporal/(Altura/100)^2,
+                 #Cut is right opened, therefore 25 will be overweight
+                 IMC_classif= cut(IMC,
+                                  breaks=c(0, 18.5, 24.9, 29.9, 34.9, 35.9, Inf),
+                                  labels=c("Baixo peso", "Peso normal", "Sobrepeso", "Obesidade grau I", "Obesidade grau II", "Obesidade grau III")),
+                 #Parse numbers (p) of weekly frequency and average 
+                 p_freq_AF_sem= as.character(Freq_AF_semanal) %>%
+                                 replace(., grepl("todos os dias",., fixed = TRUE), "7"),
+                 p_freq_AF_sem= ifelse(`Praticou AF`=="sim", Parse_avg(Freq_AF_semanal), NA),
+                 p_Dur_AF= ifelse(`Praticou AF`=="sim",Parse_avg(Duracao_AF), NA),
+                 Dur_AF_sem= p_freq_AF_sem * p_Dur_AF,
+                 #Assumindo 5 dias por semana
+                 Dur_AF_locomocao= ifelse(is.na(tempo_AF_locomocao_trabalho),0, Parse_avg(tempo_AF_locomocao_trabalho))*5 + 
+                   ifelse(is.na(tempo_AF_locomocao_curso),0, Parse_avg(tempo_AF_locomocao_curso))*5,
+                 #Faxina_dur_semana
+                 Dur_faxina_sem= Freq_faxina_semanal * 
+                   (ifelse(is.na(Duracao_faxina_horas), 0, Duracao_faxina_horas)*60 +
+                      ifelse(is.na(Duracao_faxina_minutos),0, Duracao_faxina_minutos)),
+                 #SDaily screen time
+                 screen_time_day= as.numeric(Parse_avg(Tempo_TV) %>% replace_na("0")) +
+                   as.numeric(Parse_avg(Tempo_comp_cel_tab) %>% replace_na("0"))
+                 #Alcohol 
+                 )
+```
+# Estratificação de risco
+
+O peso de cada preditor é baseado na premissa de uma relação linear entre ele e o desfecho. O desfecho é a hipertensão
+
+Esse método de análise foi baseado em:
+1.Zhang, Z., Zhang, H. & Khanal, M. K. Development of scoring system for risk stratification in clinical medicine: a step-by-step tutorial. Ann. Transl. Med. 5, 436–436 (2017).
+
+##Pontos de corte e fatores de risco utilizados
+
+### Screen time: 
+Ekelund. 2016. Does physical activity attenuate, or even eliminate, the detrimental association of sitting time with mortality? A harmonised meta-analysis of data from more than 1 million men and women
+- >8h
+- >4
+- <4
+
+```{r}
+v2020 <- v2020 %>% mutate(
+  Screen_time_classif= cut(screen_time_day,
+                           breaks= c(0, 4, 8, Inf),
+                           labels= c("Baixo", "Moderado", "Alto"), right=FALSE)# 4 será considerado moderado
+)
+```
+
+
+### Atividade física
+Apenas o tempo de AF de lazer será considerado, pois AF no trabalho não parece reduzir tanto o risco de doenças:
+Holtermann, A., Schnohr, P., Nordestgaard, B. G. & Marott, J. L. The physical activity paradox in cardiovascular disease and all-cause mortality: the contemporary Copenhagen General Population Study with 104 046 adults. European Heart Journal 42, 1499–1511 (2021).
+AF no deslocamento também não:
+Pitanga, F. J. G., Matos, S. M. A., Almeida, M. da C., Barreto, S. M. & Aquino, E. M. L. Leisure-Time Physical Activity, but not Commuting Physical Activity, is Associated with Cardiovascular Risk among ELSA-Brasil Participants. Arquivos Brasileiros de Cardiologia (2017) doi:10.5935/abc.20170178.
+
+A prática de mais de 420 minutos de AF por semana parece combater o risco de comportamento sedentário
+Holtermann, A., Schnohr, P., Nordestgaard, B. G. & Marott, J. L. The physical activity paradox in cardiovascular disease and all-cause mortality: the contemporary Copenhagen General Population Study with 104 046 adults. European Heart Journal 42, 1499–1511 (2021).
+
+Pratica de Af:
+- >150 
+- >420
+```{r}
+v2020 <- v2020 %>% mutate(
+  AF_classif= cut(Dur_AF_sem,
+                           breaks= c(0, 150, 420, Inf),
+                           labels= c("Inativo", "Ativo", "Super_ativo"), right=FALSE))
+```
+
+
+### IMC
+Aune, D. et al. BMI and all cause mortality: systematic review and non-linear dose-response meta-analysis of 230 cohort studies with 3.74 million deaths among 30.3 million participants. BMJ i2156 (2016) doi:10.1136/bmj.i2156.
+Portanto será utilizada a classificaçao do IMC
+
+
+### Idade
+Ngufor, C. et al. Development and Validation of a Risk Stratification Model Using Disease Severity Hierarchy for Mortality or Major Cardiovascular Event. JAMA Netw Open 3, e208270 (2020).
+
+- >45 & <60
+- >60 & <75
+- >75
+```{r}
+v2020 <- v2020 %>% mutate(
+  Idade_classif= cut(Idade,
+                           breaks= c(-Inf, 45, 60, 75, Inf),
+                           labels= c("Jovem", "Old_I", "Old_I", "Old_III"), right=FALSE))
+```
+
+
+### Tabaco
+Será considerado se é fumante passivo em casa (será desconsiderado no trabalho, pois é proibido fumar em locais fechados e há uma grande chance de que ao não fumar, a pessoa não terá contato direto com os fumantes em quanto eles fumam), se já fumou e se ainda fuma e se fuma
+- <5 cigarros/dia
+- >5 & <20 cigarros/dia
+- >20 cigarros/dia
+```{r}
+v2020 <- v2020 %>% mutate(
+  cigarro_classif= cut(Cigarros_dias,
+                           breaks= c(0, 5, 20, Inf),
+                           labels= c("Baixo", "Moderado", "Alto"), right=FALSE))
+```
+
+### Consumo de álcool
+Frequência semanal
+
+## Modelo estatístico 
+- Regressão logística
+
+```{r}
+Var_x <- c("Sexo", "Freq_bebida_alcoolica", "Fumante", "Ex_fumante", "Algum_fumante_em_casa", "cor_raca", "Aval_saude", "Diabetes", "Depressao", "IMC_classif", "Screen_time_classif", "AF_classif", "Idade_classif", "cigarro_classif")
+
+Formula <-paste("y ~ ", 
+                paste(Var_x, collapse = "+"), 
+                sep="") %>% as.formula()
+
+#NAs precisam ser removidos para a regressão logística
+
+v2020x <- map_df(v2020 %>% select(Var_x), as.character) %>% 
+  mutate(across(everything(), ~replace_na(., 0)))
+
+v2020x$y <- as.numeric(v2020$Pressao_alta=="sim")
+
+Fit<- v2020x %>% 
+  group_by(across(Var_x)) %>% 
+  glm(Formula, data=., family="binomial")
+
+Fit %>% summary()
+
+#Avaliando o modelo
+p_hat_logit <- predict(Fit, newdata=v2020x, type="response")
+y_hat_logit <- ifelse(p_hat_logit > 0.5, "1", "0") %>% factor
+confusionMatrix(y_hat_logit, as.factor(v2020x$y))#$overall[["Accuracy"]]
+
+
+
+  
+```
+Os coeficientes de cada variável serão extraídos e utilizados como score para stratificação de risco
+```{r}
+
+Estimates <- (function(x, y){
+  a <- map_df(x, function(x){
+    a <- str_split_fixed(y, x, 2) %>% as_tibble()
+    a %>% mutate(V1=  ifelse(grepl(x, y), x, V1)) 
+  }
+    )})(x=colnames(v2020x), y=tidy(Fit)$term) %>% 
+  na_if("") %>%
+  drop_na(V2) %>% 
+  cbind(estimate=tidy(Fit)$estimate[-1]) %>% 
+  drop_na(estimate)
+
+#Calcula o risco levando em conta os valores da fórmula da glm
+v2020$risk_index <- apply(v2020x, 1, function(x){
+  row_index <- v2020x[x,]
+  logi <- Estimates$V1 %in% colnames(row_index) & Estimates$V2 %in% t(x)
+  sum(Estimates$estimate[logi])
+})
+
+#Normaliza os valores entre 0 e 10 e clasifica em Baixo, Moderado, Alto ou Muito alto
+v2020 <- v2020 %>% mutate(
+  Risk_classif= cut(risk_index, breaks=c(-Inf, quantile(.$risk_index, probs=c(.25, .50, .75)), Inf),
+                    labels= c("Baixo", "Moderado", "Alto", "Muito_alto"), right=FALSE),
+  risk_index= scales::rescale(risk_index, to=c(0,10)))
+                                
+
+```
+### Risco da população em cada estado
+```{r}
+Risco_resumo <- v2020 %>%
+  group_by(estado, Risk_classif) %>%
+  summarise(Risco=n()) %>% 
+  mutate(Risco= round((Risco/sum(Risco))*100, 2),
+         estado=str_to_title(estado),
+         Risk_classif= gsub("_", " ", x=Risk_classif, perl=T ))
+  
+Risco_resumo %>% kable() %>% kable_styling(full_width = TRUE,
+                                           stripe_color = "azure",
+                                           bootstrap_options = "striped")
+  
+```
+#### Visualizando o risco médio em cada estado
+```{r}
+v2020 %>% group_by(estado) %>% 
+  summarise(Risco= mean(risk_index)) %>% 
+  rename(NM_ESTADO= estado)
+
+Brasil_shp <- rgdal::readOGR(dsn= "Brasil", layer="UFEBRASIL")
+
+Brasil_shp@data <- Brasil_shp@data %>% left_join(
+  v2020 %>% group_by(estado) %>% 
+  summarise(Risco_avg= mean(risk_index)) %>%
+    rename(NM_ESTADO= estado), 
+  by="NM_ESTADO")
+
+#Define a palheta de cores
+cor_pal <- colorNumeric(
+  palette = colorRampPalette(c("navyblue", "red3"))(length(Brasil_shp@data$Risco_avg)),
+  domain=Brasil_shp@data$Risco_avg,
+  na.color = NA)
+
+reverse_col_pal <- colorNumeric(
+  palette=colorRampPalette(c("red3", "navyblue"))(length(Brasil_shp@data$Risco_avg)),
+  domain=Brasil_shp@data$Risco_avg,
+  na.color=NA)
+
+
+Mapa <- leaflet(Brasil_shp) %>% 
+  setView(-50, -15, 4) %>% 
+  addTiles() %>% 
+  addPolygons(
+    stroke = T,
+    color = ~cor_pal(Risco_avg),
+    fillOpacity = .7,
+    weight = 1,
+    #Interatividade
+    highlightOptions = highlightOptions(
+      weight=10,
+      color= "gray17",
+      fillOpacity= 1,
+      bringToFront = TRUE),
+    label= paste0(str_to_title(Brasil_shp@data$NM_ESTADO), ": ", round(Brasil_shp@data$Risco_avg, 2))
+    ) %>%
+  addLegend(
+    position = "bottomright", 
+    opacity=1, 
+    pal = reverse_col_pal,
+    values= ~Brasil_shp@data$Risco_avg,
+    title = "Risco de saúde",
+    labFormat = labelFormat(transform= function(x=Brasil_shp@data$Risco_avg){
+      sort(x, decreasing = TRUE)
+    }),
+    na.label="")
+
+Mapa
+
+  
+```
+
+
+
+
+
+
