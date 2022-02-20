@@ -1,4 +1,4 @@
-#Estratificação do risco de doença nos estados do Brasil 
+# Estratificação do risco de doença nos estados do Brasil 
 Base de dados: Vigitel 2020
 
 
