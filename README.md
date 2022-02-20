@@ -1,12 +1,3 @@
----
-title: "README"
-author: "Luiz Felipe Martucci"
-date: "2/18/2022"
-output: 
-  html_document:
-    keep_md: TRUE
-  
----
 
 
 
